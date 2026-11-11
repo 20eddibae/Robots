@@ -5,7 +5,9 @@ navigation node, for the right-hand panel):
 
     python3 ~/a2r-student/robot/src/team_navigation/team_navigation/stream.py
 
-Then open http://ROBOT_IP:8081/ in a browser on the robot's Wi-Fi.
+Then open http://localhost:8081/ in your laptop browser, having connected
+with an SSH tunnel: ssh -L 8081:localhost:8081 a2r-lab-jetson@ROBOT_IP
+(or http://ROBOT_IP:8081/ directly, if the browser may reach the robot LAN).
 Left: camera, with the median HSV colour of the boxed bottom-centre region
 (compare with yellow_hsv_low/high in config/navigation.yaml).
 Right: navigation/debug_image (magenta = counted as yellow, green = trail,
@@ -159,7 +161,10 @@ def main():
     server = ThreadingHTTPServer(('0.0.0.0', PORT), make_handler(viewer))
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    print(f'Open http://{robot_ip()}:{PORT}/ in a browser on the robot Wi-Fi. Ctrl+C to stop.')
+    print(f'Viewer running. Open in your laptop browser:\n'
+          f'  via SSH tunnel (ssh -L {PORT}:localhost:{PORT} ...):  http://localhost:{PORT}/\n'
+          f'  or directly on the robot Wi-Fi:                       http://{robot_ip()}:{PORT}/\n'
+          f'Ctrl+C to stop.')
     try:
         rclpy.spin(viewer)
     except KeyboardInterrupt:

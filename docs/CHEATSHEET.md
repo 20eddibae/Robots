@@ -75,10 +75,15 @@ Left spin gave 0.2142 m and right spin 0.2252 m (5% apart, within the 10% limit)
 
 ## Live view in your browser (terminal C)
 
+SSH into terminal C with a tunnel:
+```bash
+ssh -L 8081:localhost:8081 a2r-lab-jetson@192.168.0.167
+```
+Then, after `source ~/a2r-student/robot/setup_terminal.sh`:
 ```bash
 python3 ~/a2r-student/robot/src/team_navigation/team_navigation/stream.py
 ```
-Open `http://192.168.0.167:8081/` on the robot's Wi-Fi. Left: camera with the HSV colour of the boxed bottom-centre area. Right: what our code sees (magenta = counted as yellow, green dots = trail, white circle = steering target, top line = status, speed, yaw). Ctrl+C to stop. It only views; it never sends motion.
+Open **`http://localhost:8081/`** in your laptop browser (not the robot IP; macOS may block browsers from the robot LAN unless allowed under System Settings → Privacy & Security → Local Network). Left: camera with the HSV colour of the boxed bottom-centre area. Right: what our code sees (magenta = counted as yellow, green dots = trail, white circle = steering target, top line = status, speed, yaw). Ctrl+C to stop. It only views; it never sends motion.
 
 ## Jetson: checks (terminal C, one at a time, Ctrl+C to stop)
 
@@ -154,6 +159,47 @@ To go again after a stop: release everything, center the sticks, then hold RB.
 | `autonomous conversion not configured` | `track_width_m` not set in the base launch |
 | `navigation request expired` | Terminal B crashed or stopped; check its log |
 | `hardware or joystick stale` | Base unhealthy; check terminal A and `hardware/status` |
+
+## Base won't start: troubleshooting
+
+**`BlockingIOError: Resource temporarily unavailable`** (on `fcntl.flock`): another program already owns the RVR connection, usually a base launch left running by you or a teammate. Check with the team before stopping anything.
+
+See what's running:
+```bash
+ps aux | grep -E "ros2 launch|a2r_robot|team_navigation|rvr_io" | grep -v grep
+```
+Leave `jetson_oled.py` (the OLED display service) running; it's always there and doesn't block the base.
+```bash
+tmux ls
+```
+If it's in tmux, stop it cleanly: `tmux attach -t NAME`, Ctrl+C in each window, then Ctrl+b `d` to leave.
+
+Otherwise stop all ROS launches (same as Ctrl+C, so the base shuts down properly):
+```bash
+pkill -INT -f "ros2 launch"
+```
+Wait ~10 s and run the `ps` line again. Leftover processes whose launch is already gone are not caught by that. Stop them by name:
+```bash
+pkill -f "a2r_robot/lib/a2r_robot"
+```
+```bash
+pkill -f "team_navigation/lib/team_navigation"
+```
+Or stop one specific process by its PID (2nd column of `ps`). Use `kill`, not `pkill`: `pkill 3830` looks for a process *named* 3830.
+```bash
+kill PID
+```
+Still there after a few seconds: `kill -9 PID`. Then relaunch terminal A.
+
+If our navigation node keeps reappearing after a reboot with no terminal attached, something is auto-starting it; check `systemctl --user list-units --type=service --no-pager` and `crontab -l`.
+
+**`TimeoutError`** (traceback through `probe` / `get_main_application_version`): the RVR isn't answering over the UART.
+1. RVR off or asleep (it sleeps when idle): press its power button, check its lights, relaunch.
+2. RVR battery low: charge or swap.
+3. Something else owns the UART (another base or an `rvr_io` demo): run the `ps` line above.
+4. Wiring: power everything off before checking TX/RX and ground.
+
+A good start shows `UART communication OK; motors commanded OFF.` then `ready for deliberate selection`.
 
 ## End of session
 
