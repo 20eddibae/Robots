@@ -2,3 +2,29 @@
   ros__parameters:
     # A suggested development setting, not permission to move the car.
     requested_forward_speed_m_s: 0.05
+
+    # Pure pursuit: aim at the trail point this far ahead (metres).
+    lookahead_m: 0.30
+    max_yaw_rate_rad_s: 1.0
+    # Fewer visible trail points than this counts as "path lost" -> stop.
+    min_trail_points: 3
+
+    # Ignore camera frames older than this (seconds).
+    max_image_age_s: 0.3
+
+    # Vision. image_scale resizes frames before masking (0.25: 1280x720 -> 320x180).
+    # OpenCV HSV ranges: H 0-179, S 0-255, V 0-255.
+    image_scale: 0.25
+    yellow_hsv_low: [15, 70, 70]
+    yellow_hsv_high: [40, 255, 255]
+
+    # 3x3 pixel -> floor homography in row order, from geometry.compute_homography.
+    # Pixels must be at image_scale resolution. Write every entry as a float
+    # (e.g. 1.0, not 1). All zeros = not calibrated -> zero motion.
+    # TEMPORARY rough value for checking steering direction only (bottom of
+    # image ~0.1 m ahead, top ~0.64 m, image centre straight ahead). Replace
+    # with the tape-mark calibration before driving.
+    homography: [0.0, -0.003, 0.64, -0.003, 0.0, 0.48, 0.0, 0.0, 1.0]
+
+    # Publish navigation/debug_image (mask + trail + target) for RViz.
+    publish_debug_image: true

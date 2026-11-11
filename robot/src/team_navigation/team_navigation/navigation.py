@@ -1,9 +1,18 @@
-"""Receive sensors and request motion through the supplied safety node.
+"""Follow a yellow floor path: camera -> mask -> trail -> floor -> pure pursuit.
 
-The supplied hooks return no action. Implement perception and control here
-or distribute those responsibilities across additional team nodes.
+Pipeline (each step is a ROS-free module that can be tested offline):
+  process_image   vision.yellow_mask + vision.centerline  -> trail in pixels
+  update_estimate geometry.pixel_to_floor                  -> trail in metres
+  choose_action   follow if enough trail is visible, otherwise stop
+  compute_motion  controller.pure_pursuit                  -> (forward, yaw)
+
+Requests zero motion whenever the image is stale, the path is lost, or the
+homography has not been calibrated. Motion still passes through the supplied
+safety node (RB held, measured track_width_m).
 """
 import math
+import cv2
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy
@@ -11,21 +20,43 @@ from rclpy.executors import ExternalShutdownException
 from sensor_msgs.msg import Image, Imu
 from cv_bridge import CvBridge
 from course_robot_interfaces.msg import MotionRequest
+from team_navigation.vision import yellow_mask, centerline
+from team_navigation.geometry import pixel_to_floor, homography_from_list
+from team_navigation.controller import pure_pursuit
 
 
 class Navigation(Node):
     def __init__(self):
         super().__init__('navigation')
-        self.target_speed = self.declare_parameter('requested_forward_speed_m_s', .05).value
+        param = lambda name, default: self.declare_parameter(name, default).value
+        self.target_speed = param('requested_forward_speed_m_s', .05)
+        self.lookahead_m = param('lookahead_m', .30)
+        self.max_yaw = param('max_yaw_rate_rad_s', 1.0)
+        self.min_points = param('min_trail_points', 3)
+        self.max_image_age = param('max_image_age_s', .3)
+        self.image_scale = param('image_scale', .25)
+        self.yellow_low = tuple(param('yellow_hsv_low', [15, 70, 70]))
+        self.yellow_high = tuple(param('yellow_hsv_high', [40, 255, 255]))
+        H = param('homography', [0.] * 9)  # all zeros means "not calibrated"
+        self.H = homography_from_list(H) if any(H) else None
+        publish_debug = param('publish_debug_image', True)
+
         self.bridge = CvBridge()
         self.image = self.image_stamp = self.imu = None
+        self.mask = self.trail_px = self.target = None
         self.previous_error = None
         self.create_subscription(Image, 'camera/image_raw', self.image_cb, qos_profile_sensor_data)
         self.create_subscription(Imu, 'imu/data', self.imu_cb, qos_profile_sensor_data)
         self.publisher = self.create_publisher(
             MotionRequest, 'navigation/request',
             QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
+        self.debug_pub = (self.create_publisher(Image, 'navigation/debug_image', 1)
+                          if publish_debug else None)
         self.create_timer(.05, self.tick)
+        if self.H is None:
+            self.get_logger().warning(
+                'homography not calibrated: requesting zero motion '
+                '(the debug image still shows the mask and trail)')
 
     def image_cb(self, msg):
         try:
@@ -39,40 +70,57 @@ class Navigation(Node):
     def imu_cb(self, msg):
         self.imu = msg
 
-    def process_image(self, image):
-        """Estimate road position from a BGR image; return None if unknown.
+    def image_is_fresh(self):
+        """True if the latest image is no older than max_image_age_s."""
+        if self.image is None or self.image_stamp is None:
+            return False
+        now_ns = self.get_clock().now().nanoseconds
+        stamp_ns = self.image_stamp.sec * 10**9 + self.image_stamp.nanosec
+        age = (now_ns - stamp_ns) / 1e9
+        return -.05 <= age <= self.max_image_age
 
-        Decide what observation to return and document its units. Check for
-        a missing image before using it. You decide how old an image may be
-        before it should no longer guide the car; image_stamp is available.
-        Agree on units, validity and timestamps for observations passed
-        between your team's processing hooks.
+    def process_image(self, image):
+        """Return the path centerline as [(u, v), ...] mask pixels, or None.
+
+        None means no usable image (missing or older than max_image_age_s).
+        An empty list means the image is fine but no path was found.
         """
-        return None
+        self.mask = self.trail_px = None
+        if image is None or not self.image_is_fresh():
+            return None
+        self.mask = yellow_mask(image, self.yellow_low, self.yellow_high, self.image_scale)
+        self.trail_px = centerline(self.mask)
+        return self.trail_px
 
     def update_estimate(self, observation, imu):
-        """Combine current observations with state retained between callbacks.
+        """Return the trail as an N x 2 array of floor (x fwd, y left) metres, or None.
 
-        Filtering is optional. Explain any use of IMU axes and units, and
-        distinguish a road-relative estimate from a global position.
+        Road-relative only: these are positions relative to the robot right
+        now, not a global position. The IMU is not used yet.
         """
-        return None
+        if not observation or self.H is None:
+            return None
+        return pixel_to_floor(observation, self.H)
 
     def choose_action(self, estimate):
-        """Choose a desired behavior, such as stop or follow the road."""
-        return None
+        """Follow the trail if enough of it is visible; None means stop."""
+        if estimate is None or len(estimate) < self.min_points:
+            return None
+        return estimate
 
     def compute_motion(self, action):
         """Return (forward m/s, left-turn rad/s); no action means zero motion.
 
-        Implement your controller here. A positive yaw request turns left.
-        For student-determined separation b (metres), safety converts to treads
-        v - b*w/2 and v + b*w/2. Y selects the global tread-speed limit:
-        Low 0.15, Medium 0.60, or High 1.40 m/s. If either exceeds that limit,
-        it scales both together, preserving their ratio without disarming.
-        Invalid or stale requests still stop and disarm. See the README.
+        Pure pursuit toward the trail point about lookahead_m ahead. The
+        safety node converts this to treads using the measured track width
+        and scales both treads together if either exceeds the speed profile.
         """
-        return 0., 0.
+        self.target = None
+        if action is None:
+            return 0., 0.
+        forward, yaw, self.target = pure_pursuit(
+            action, self.target_speed, self.lookahead_m, self.max_yaw, self.min_points)
+        return forward, yaw
 
     def tick(self):
         forward, yaw = 0., 0.
@@ -94,6 +142,43 @@ class Navigation(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.forward_speed_m_s, msg.yaw_rate_rad_s = float(forward), float(yaw)
         self.publisher.publish(msg)
+        try:
+            self.publish_debug_image(msg.forward_speed_m_s, msg.yaw_rate_rad_s)
+        except Exception as exc:  # debugging must never affect motion
+            self.get_logger().error(f'Debug image failed: {exc}')
+
+    def publish_debug_image(self, forward, yaw):
+        """Publish the camera view with what the code sees drawn on top.
+
+        Magenta tint: pixels counted as yellow. Green dots: traced trail.
+        White circle: lookahead target. Top line: status and the request sent.
+        """
+        if self.debug_pub is None or self.mask is None or self.image is None:
+            return
+        h, w = self.mask.shape
+        view = cv2.resize(self.image, (w, h), interpolation=cv2.INTER_AREA)
+        yellow = self.mask.astype(bool)
+        view[yellow] = (.4 * view[yellow] + .6 * np.array([255, 0, 255])).astype(np.uint8)
+        for u, v in self.trail_px or []:
+            cv2.circle(view, (int(u), int(v)), 2, (0, 255, 0), -1)
+        if self.target is not None and self.H is not None:
+            u, v = pixel_to_floor([self.target], np.linalg.inv(self.H))[0]
+            cv2.circle(view, (int(u), int(v)), 6, (255, 255, 255), 2)
+        if self.H is None:
+            status = 'NO CALIBRATION'
+        elif not self.trail_px:
+            status = 'NO PATH'
+        elif self.target is None:
+            status = 'PATH TOO SHORT'
+        else:
+            status = 'FOLLOWING'
+        text = f'{status}  v={forward:.2f} yaw={yaw:+.2f}'
+        for color, thickness in (((0, 0, 0), 3), ((255, 255, 255), 1)):
+            cv2.putText(view, text, (4, 14), cv2.FONT_HERSHEY_SIMPLEX, .4,
+                        color, thickness, cv2.LINE_AA)
+        msg = self.bridge.cv2_to_imgmsg(view, encoding='bgr8')
+        msg.header.stamp = self.image_stamp
+        self.debug_pub.publish(msg)
 
 
 def main():
