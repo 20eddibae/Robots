@@ -161,7 +161,13 @@ To go again after a stop: release everything, center the sticks, then hold RB.
 | `lookahead_m`                        | Zig-zags: increase. Cuts corners: decrease.                                                                                                                                                    |
 | `max_yaw_rate_rad_s`                 | Turn rate limit                                                                                                                                                                                |
 | `yellow_hsv_low` / `yellow_hsv_high` | Yellow threshold (H 0-179), now `[18, 120, 140]`-`[35, 255, 255]`. Use the live view's box HSV readout on the paper. Misses yellow: lower S/V minimums. Carpet counts as yellow: raise S minimum. Wall counts as yellow: raise V minimum (lab wall V ~96, paper ~205). |
-| `path_gap_px` | Merge yellow groups closer than `[sideways, along-path]` px before tracing, now `[9, 25]`. Trail stops at gaps between sheets: raise the 2nd number. Separate paths merge: lower the 1st. `[0, 0]` = off. |
+| `max_gap_px` | Widest stretch of grey floor a path may cross between yellow sheets (bottom-row px, shrinks with distance), now `120`. Trail stops at gaps: raise. Trail wanders over carpet: lower. |
+| `blue_hsv_low/high` | Blue paper = no-go (red in the viewer). Blue not all red: widen. Carpet turning red: raise the S minimum. |
+| `car_hsv_low/high` | Other cars (orange + `CAR` in the viewer). Car missed: raise S max / lower V min. Glare flagged as a car: the reverse. |
+| `horizon_frac` | Row where the floor vanishes, as a fraction of image height, now `0.28`. Set once for the camera tilt. |
+| `blue_margin_px`, `car_margin_px` | Clearance from blue / cars. |
+| `blue_hug_gain` | Pull towards blue for tight turns, now `0.3`; `0.0` = off. |
+| `turn_cost` | Higher = straighter trail, lower = hugs the middle of the yellow. |
 | `homography`                         | Camera calibration, 9 floats. All zeros means zero motion.                                                                                                                                     |
 | `max_image_age_s`                    | Ignore older camera frames                                                                                                                                                                     |
 

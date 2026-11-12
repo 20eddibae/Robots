@@ -1,15 +1,17 @@
 /**:
   ros__parameters:
     # A suggested development setting, not permission to move the car.
-    requested_forward_speed_m_s: 0.125
+    requested_forward_speed_m_s: 0.25
 
-    # Steering. 'taut': aim at the farthest trail point reachable in a
-    # straight line inside the yellow (ignores small wiggles, uses the path's
-    # width in turns); falls back to 'center' when that point is nearer than
-    # lookahead_m. 'center': aim at the trail point lookahead_m ahead.
+    # Steering. 'taut': aim at the farthest point of the traced path that can
+    # be reached in a straight line on the road and off no-go (ignores bends
+    # in the path, uses the road's width in turns); falls back to 'center'
+    # when that point is nearer than lookahead_m. 'center': aim at the path
+    # point lookahead_m ahead.
     steering: taut
-    # Keep the straight line this fraction of the path's width from each edge.
-    edge_margin_frac: 0.15
+    # Yellow support (0..1, see vision.floor_fields) the straight line must
+    # keep: higher stays further from the road's edges, lower cuts corners.
+    taut_min_support: 0.5
     # Minimum aim distance (metres); the only aim distance for 'center'.
     lookahead_m: 0.20
     max_yaw_rate_rad_s: 1.0
@@ -26,9 +28,27 @@
     # saturation but is darker (paper V ~205, wall V ~96).
     yellow_hsv_low: [18, 120, 140]
     yellow_hsv_high: [35, 255, 255]
-    # Merge yellow groups closer than [sideways, along-path] pixels (at
-    # image_scale) before tracing the path. [0, 0] turns it off.
-    path_gap_px: [9, 25]
+    # Blue paper is no-go: a path never touches it.
+    blue_hsv_low: [95, 60, 40]
+    blue_hsv_high: [130, 255, 255]
+    # Other cars (light grey body: any hue, low S, bright) are no-go too.
+    car_hsv_low: [0, 0, 150]
+    car_hsv_high: [179, 80, 255]
+
+    # Path estimation (vision.trace_paths). Sizes are in pixels at image_scale
+    # as seen at the BOTTOM row; they shrink automatically with distance.
+    # Row where the floor would vanish, as a fraction of image height (0 = top).
+    horizon_frac: 0.28
+    # Widest stretch of non-yellow, non-blue floor a path may cross.
+    max_gap_px: 120.0
+    # Clearance kept from blue and from other cars.
+    blue_margin_px: 6.0
+    car_margin_px: 15.0
+    # Pull towards blue so turns round it are tight (0.0 = none).
+    blue_hug_gain: 0.3
+    # Price of moving sideways: higher = straighter paths, lower = follows
+    # the middle of the yellow more closely.
+    turn_cost: 0.15
 
     # 3x3 pixel -> floor homography in row order, from geometry.compute_homography.
     # Pixels must be at image_scale resolution. Write every entry as a float

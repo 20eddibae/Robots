@@ -10,7 +10,8 @@ with an SSH tunnel: ssh -L 8081:localhost:8081 a2r-lab-jetson@ROBOT_IP
 (or http://ROBOT_IP:8081/ directly, if the browser may reach the robot LAN).
 Left: camera, with the median HSV colour of the boxed bottom-centre region
 (compare with yellow_hsv_low/high in config/navigation.yaml).
-Right: navigation/debug_image (magenta = counted as yellow, green = trail,
+Right: navigation/debug_image (magenta = counted as yellow, red = blue no-go,
+orange = other car, green = trail followed, cyan = other paths seen,
 white circle = steering target, top line = status and request).
 Ctrl+C to stop. A viewing tool only; it never sends motion.
 """
@@ -40,7 +41,8 @@ body{margin:0;background:#111;color:#ddd;font:14px system-ui,sans-serif}
 img{width:100%;max-width:1280px;display:block;margin:auto}
 p{max-width:1280px;margin:8px auto;padding:0 12px}
 </style></head><body><img src="/stream">
-<p>Left: camera + bottom-centre HSV. Right: magenta = yellow, green = trail,
+<p>Left: camera + bottom-centre HSV. Right: magenta = yellow, red = blue
+(no-go), orange = other car, green = trail followed, cyan = other paths,
 white circle = target.</p></body></html>"""
 
 
