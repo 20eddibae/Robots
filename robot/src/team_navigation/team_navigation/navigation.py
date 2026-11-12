@@ -35,8 +35,9 @@ class Navigation(Node):
         self.min_points = param('min_trail_points', 3)
         self.max_image_age = param('max_image_age_s', .3)
         self.image_scale = param('image_scale', .25)
-        self.yellow_low = tuple(param('yellow_hsv_low', [15, 70, 70]))
-        self.yellow_high = tuple(param('yellow_hsv_high', [40, 255, 255]))
+        self.yellow_low = tuple(param('yellow_hsv_low', [18, 120, 140]))
+        self.yellow_high = tuple(param('yellow_hsv_high', [35, 255, 255]))
+        self.path_gap_px = tuple(param('path_gap_px', [9, 25]))
         H = param('homography', [0.] * 9)  # all zeros means "not calibrated"
         self.H = homography_from_list(H) if any(H) else None
         publish_debug = param('publish_debug_image', True)
@@ -89,7 +90,7 @@ class Navigation(Node):
         if image is None or not self.image_is_fresh():
             return None
         self.mask = yellow_mask(image, self.yellow_low, self.yellow_high, self.image_scale)
-        self.trail_px = centerline(self.mask)
+        self.trail_px = centerline(self.mask, gap_px=self.path_gap_px)
         return self.trail_px
 
     def update_estimate(self, observation, imu):

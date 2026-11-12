@@ -1,10 +1,10 @@
 /**:
   ros__parameters:
     # A suggested development setting, not permission to move the car.
-    requested_forward_speed_m_s: 0.05
+    requested_forward_speed_m_s: 0.125
 
     # Pure pursuit: aim at the trail point this far ahead (metres).
-    lookahead_m: 0.30
+    lookahead_m: 0.20
     max_yaw_rate_rad_s: 1.0
     # Fewer visible trail points than this counts as "path lost" -> stop.
     min_trail_points: 3
@@ -15,8 +15,13 @@
     # Vision. image_scale resizes frames before masking (0.25: 1280x720 -> 320x180).
     # OpenCV HSV ranges: H 0-179, S 0-255, V 0-255.
     image_scale: 0.25
-    yellow_hsv_low: [15, 70, 70]
-    yellow_hsv_high: [40, 255, 255]
+    # V min 140: under the lab lighting the wall has the paper's hue and
+    # saturation but is darker (paper V ~205, wall V ~96).
+    yellow_hsv_low: [18, 120, 140]
+    yellow_hsv_high: [35, 255, 255]
+    # Merge yellow groups closer than [sideways, along-path] pixels (at
+    # image_scale) before tracing the path. [0, 0] turns it off.
+    path_gap_px: [9, 25]
 
     # 3x3 pixel -> floor homography in row order, from geometry.compute_homography.
     # Pixels must be at image_scale resolution. Write every entry as a float
