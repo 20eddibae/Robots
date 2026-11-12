@@ -9,7 +9,9 @@ Then open http://localhost:8081/ in your laptop browser, having connected
 with an SSH tunnel: ssh -L 8081:localhost:8081 a2r-lab-jetson@ROBOT_IP
 (or http://ROBOT_IP:8081/ directly, if the browser may reach the robot LAN).
 Left: camera, with the median HSV colour of the boxed bottom-centre region
-(compare with yellow_hsv_low/high in config/navigation.yaml).
+(compare with yellow_hsv_low/high in config/navigation.yaml), the speed
+profile from safety/status (Low/Medium/High and its tread limit), the safety
+state and the tread speeds actually commanded.
 Right: navigation/debug_image (magenta = counted as yellow, red = blue no-go,
 orange = other car, green = trail followed, cyan = other paths seen,
 white circle = steering target, top line = status and request).
@@ -28,6 +30,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
+from std_msgs.msg import String
 
 PORT = 8081
 FPS = 10
@@ -41,7 +44,8 @@ body{margin:0;background:#111;color:#ddd;font:14px system-ui,sans-serif}
 img{width:100%;max-width:1280px;display:block;margin:auto}
 p{max-width:1280px;margin:8px auto;padding:0 12px}
 </style></head><body><img src="/stream">
-<p>Left: camera + bottom-centre HSV. Right: magenta = yellow, red = blue
+<p>Left: camera + bottom-centre HSV, speed profile, safety state and
+commanded tread speeds. Right: magenta = yellow, red = blue
 (no-go), orange = other car, green = trail followed, cyan = other paths,
 white circle = target.</p></body></html>"""
 
@@ -50,6 +54,28 @@ def label(image, text, y=20):
     for color, thickness in (((0, 0, 0), 4), ((255, 255, 255), 1)):
         cv2.putText(image, text, (8, y), cv2.FONT_HERSHEY_SIMPLEX, .55,
                     color, thickness, cv2.LINE_AA)
+
+
+def parse_status(text):
+    """Split a safety/status line into its state and key=value fields.
+
+    'ready for deliberate selection; mode=stopped; speed_profile=Low; ...'
+    -> ('ready for deliberate selection', {'mode': 'stopped', ...})
+    """
+    parts = [p.strip() for p in text.split(';')]
+    fields = dict(p.split('=', 1) for p in parts[1:] if '=' in p)
+    return parts[0], fields
+
+
+def safety_lines(text):
+    """Two short display lines for a safety/status message."""
+    state, f = parse_status(text)
+    profile = f.get('speed_profile', '?')
+    limit = f.get('tread_limit', '?').replace(' m/s', '')
+    treads = f.get('commanded_treads', '(?,?)').replace(' m/s', '').strip('()')
+    left, _, right = treads.partition(',')
+    return (f'speed: {profile} (tread limit {limit} m/s)',
+            f'{state[:34]} | treads L {left} R {right}')
 
 
 def placeholder(width, text):
@@ -77,6 +103,9 @@ class Viewer(Node):
                 Image, f'/{namespace}/{topic}',
                 lambda msg, name=name: self.latest.__setitem__(name, (time.monotonic(), msg)),
                 qos_profile_sensor_data)
+        self.create_subscription(
+            String, f'/{namespace}/safety/status',
+            lambda msg: self.latest.__setitem__('safety', (time.monotonic(), msg.data)), 10)
         self.create_timer(1. / FPS, self.compose)
 
     def frame(self, name):
@@ -96,6 +125,12 @@ class Viewer(Node):
         H, S, V = np.median(hsv, axis=0).astype(int)
         cv2.rectangle(image, (x0, y0), (x1, h - 1), (255, 255, 255), 1)
         label(image, f'box HSV: H {H}  S {S}  V {V}')
+        entry = self.latest.get('safety')
+        if entry is None or time.monotonic() - entry[0] > STALE_S:
+            label(image, 'speed: no safety status (is the base running?)', 44)
+        else:
+            for i, line in enumerate(safety_lines(entry[1])):
+                label(image, line, 44 + 22 * i)
         return image
 
     def debug_panel(self, width):

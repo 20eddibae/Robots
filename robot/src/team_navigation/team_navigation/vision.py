@@ -150,10 +150,67 @@ def _off_road_distance(on_road, scale):
                       np.minimum(rows - above, below - rows) / (size * size))
 
 
+def _window_support(yellow, radius):
+    """Fraction of yellow in a sideways window of `radius` px (per row) around
+    each pixel; beyond the image edge counts as not yellow."""
+    h, w = yellow.shape
+    radius = np.asarray(radius).reshape(-1, 1)
+    cols = np.arange(w)[None, :]
+    total = np.zeros((h, w + 1), np.float32)
+    total[:, 1:] = np.cumsum(yellow, axis=1)
+    inside = (np.take_along_axis(total, np.clip(cols + radius + 1, 0, w), 1)
+              - np.take_along_axis(total, np.clip(cols - radius, 0, w), 1))
+    return inside / (2 * radius + 1)
+
+
+def _row_distance(mask):
+    """Sideways distance (px) from each pixel to the nearest mask pixel in the
+    same row (large where the row has none)."""
+    w = mask.shape[1]
+    cols = np.arange(w)[None, :]
+    on = mask.astype(bool)
+    left = np.maximum.accumulate(np.where(on, cols, -10 * w), axis=1)
+    right = np.minimum.accumulate(np.where(on, cols, 11 * w)[:, ::-1], axis=1)[:, ::-1]
+    return np.minimum(cols - left, right - cols).astype(np.float32)
+
+
+def body_px(height, horizon_frac=.28, robot_half_width_px=0., footprint_skip_frac=.1):
+    """Robot half-width in pixels for each image row (0 where not applied).
+
+    robot_half_width_px is measured at the bottom row and shrinks with
+    distance like every other size (see floor_scale). Rows in the bottom
+    footprint_skip_frac of the image get 0: the robot is already there and
+    cannot steer out of it, and its treads are mostly outside the image.
+    """
+    scale = floor_scale(height, horizon_frac)
+    active = np.arange(height) < height * (1 - footprint_skip_frac)
+    return robot_half_width_px * scale * active
+
+
+def footprint_support(yellow, horizon_frac=.28, robot_half_width_px=150.,
+                      footprint_skip_frac=.1):
+    """H x W fraction (0..1) of the robot's width that would be on yellow if
+    the robot's centre were at each pixel, i.e. how much of the span between
+    its treads is on the road. Rows the footprint is not applied to get 1."""
+    radius = np.rint(body_px(yellow.shape[0], horizon_frac, robot_half_width_px,
+                             footprint_skip_frac)).astype(int)
+    support = _window_support(yellow, radius)
+    support[radius == 0, :] = 1.
+    return support
+
+
 def floor_fields(yellow, blue=None, obstacle=None, horizon_frac=.28,
                  half_width_px=40., blue_margin_px=6., obstacle_margin_px=15.,
-                 blue_hug_px=20., blue_hug_gain=.3, max_gap_px=120.):
+                 blue_hug_px=20., blue_hug_gain=.3, max_gap_px=120.,
+                 robot_half_width_px=0., footprint_skip_frac=.1):
     """Return (scale, support, nogo, reward) describing where a path may be.
+
+    A path is where the robot's CENTRE goes. With robot_half_width_px > 0
+    (the robot's half-width at the bottom row, see body_px) blue and
+    obstacles are also widened SIDEWAYS, within each row, by the robot's
+    half-width there, so a path keeps both treads, not just the centre, off
+    blue and away from cars. (Sideways only: the width is across the robot,
+    so it must not reach forward to block rows the blue is not in.)
 
     scale:   floor_scale for each row.
     support: H x W floats 0..1, the fraction of yellow in a sideways window
@@ -168,7 +225,11 @@ def floor_fields(yellow, blue=None, obstacle=None, horizon_frac=.28,
                on the road    support^2 (most mid-road), times
                               (1 + blue_hug_gain) within blue_hug_px of blue's
                               margin, so a path rounding blue takes the tight
-                              inside line;
+                              inside line; with robot_half_width_px > 0,
+                              support x footprint_support instead of
+                              support^2, so paths that would put a tread off
+                              the yellow earn less (a preference, not a ban,
+                              so gaps between sheets can still be crossed);
                off the road   -GAP_COST, if road is within max_gap_px / 2 (a
                               gap of up to max_gap_px can be crossed, at a
                               price);
@@ -176,22 +237,31 @@ def floor_fields(yellow, blue=None, obstacle=None, horizon_frac=.28,
     """
     h, w = yellow.shape
     scale = floor_scale(h, horizon_frac)
-    radius = np.rint(half_width_px * scale).astype(int)[:, None]
-    cols = np.arange(w)[None, :]
-    total = np.zeros((h, w + 1), np.float32)
-    total[:, 1:] = np.cumsum(yellow, axis=1)
-    inside = (np.take_along_axis(total, np.clip(cols + radius + 1, 0, w), 1)
-              - np.take_along_axis(total, np.clip(cols - radius, 0, w), 1))
-    support = inside / (2 * radius + 1)  # beyond the image edge counts as not yellow
+    radius = np.rint(half_width_px * scale).astype(int)
+    support = _window_support(yellow, radius)
     on_road = support >= ON_ROAD
-    reward = np.where(on_road, support * support, -GAP_COST).astype(np.float32)
+    on_road_reward = support * support
+    if robot_half_width_px > 0:
+        on_road_reward = support * footprint_support(yellow, horizon_frac,
+                                                     robot_half_width_px, footprint_skip_frac)
+    reward = np.where(on_road, on_road_reward, -GAP_COST).astype(np.float32)
     nogo = np.repeat(scale[:, None] < MIN_SCALE, w, axis=1)
+    body = body_px(h, horizon_frac, robot_half_width_px, footprint_skip_frac)[:, None]
     for mask, margin_px in ((blue, blue_margin_px), (obstacle, obstacle_margin_px)):
         if mask is not None and mask.any():
             away = cv2.distanceTransform((mask == 0).astype(np.uint8), cv2.DIST_L2, 3)
-            nogo |= away <= margin_px * scale[:, None]
+            margin = margin_px * scale[:, None]
+            near = away <= margin
+            if body.any():
+                side = _row_distance(mask)
+                near |= side <= body + margin
+            nogo |= near
             if mask is blue:
-                hug = on_road & (away <= (margin_px + blue_hug_px) * scale[:, None])
+                hug_px = blue_hug_px * scale[:, None]
+                hug = away <= margin + hug_px
+                if body.any():
+                    hug |= side <= body + margin + hug_px
+                hug &= on_road
                 reward[hug] *= 1. + blue_hug_gain
     # Reward is per unit of floor: a far row covers more floor than a near
     # one (up to a limit, so the far end does not outweigh the road nearby).
@@ -239,8 +309,12 @@ def _walk_back(best, step, row, reach):
 def trace_paths(yellow, blue=None, obstacle=None, horizon_frac=.28,
                 half_width_px=40., blue_margin_px=6., obstacle_margin_px=15.,
                 blue_hug_px=20., blue_hug_gain=.3, max_gap_px=120.,
-                turn_cost=.15, max_paths=3):
+                turn_cost=.15, max_paths=3, robot_half_width_px=0.,
+                footprint_skip_frac=.1):
     """Estimate the paths leading away from the robot; the best one first.
+
+    robot_half_width_px, footprint_skip_frac: see floor_fields / body_px
+    (keep both treads, not just the centre, clear of blue and cars).
 
     Returns a list of paths, each a list of (u, v) mask pixels ordered
     near -> far (one point per image row), starting at the robot (bottom
@@ -268,8 +342,9 @@ def trace_paths(yellow, blue=None, obstacle=None, horizon_frac=.28,
     h, w = yellow.shape
     scale, support, nogo, reward = floor_fields(
         yellow, blue, obstacle, horizon_frac, half_width_px, blue_margin_px,
-        obstacle_margin_px, blue_hug_px, blue_hug_gain, max_gap_px)
-    top = int(np.argmax(scale >= MIN_SCALE))  # first usable row; work on rows top..h-1
+        obstacle_margin_px, blue_hug_px, blue_hug_gain, max_gap_px,
+        robot_half_width_px, footprint_skip_frac)
+    top =int(np.argmax(scale >= MIN_SCALE))  # first usable row; work on rows top..h-1
     scale, support, nogo, reward = scale[top:], support[top:], nogo[top:], reward[top:]
     rows = h - top
 
@@ -363,9 +438,15 @@ def _finish_path(path, support, nogo):
         return np.empty((0, 2))
     path = path[:on_road[-1] + 1]
     if len(path) >= 7:  # 7-point moving average, end points held in place
+        raw = path
         padded = np.concatenate([path[:1]] * 3 + [path] + [path[-1:]] * 3)
         path = np.stack([np.convolve(padded[:, k], np.full(7, 1 / 7), 'valid')
                          for k in (0, 1)], axis=1)
+        # Smoothing can pull a path that hugs no-go (e.g. blue widened by the
+        # robot's footprint) slightly into it; keep the traced point there
+        # instead of cutting the whole path short.
+        pulled_in = look(nogo)
+        path[pulled_in] = raw[pulled_in]
     blocked = np.flatnonzero(look(nogo))
     return path[:blocked[0]] if len(blocked) else path
 
@@ -410,7 +491,8 @@ def centerline(mask, blue=None, obstacle=None, previous=None, **settings):
 
 def straight_reach(path, yellow, blue=None, obstacle=None, min_support=.5,
                    horizon_frac=.28, half_width_px=40., blue_margin_px=6.,
-                   obstacle_margin_px=15., max_gap_px=120., **_unused):
+                   obstacle_margin_px=15., max_gap_px=120., robot_half_width_px=0.,
+                   footprint_skip_frac=.1, **_unused):
     """Farthest point of a path the robot can head for in a straight line.
 
     The "taut string" used by 'taut' steering: instead of following every
@@ -421,8 +503,11 @@ def straight_reach(path, yellow, blue=None, obstacle=None, min_support=.5,
     image, so this works in pixels without camera calibration.
 
     On the road means yellow support (see floor_fields) of at least
-    min_support: higher keeps the line further from the road's edges. No-go
-    (blue, cars and their margins) is never crossed. The stretch before the
+    min_support: higher keeps the line further from the road's edges. With
+    robot_half_width_px > 0, support is measured across the robot's whole
+    width (footprint_support), so min_support is the fraction of the span
+    between the treads that must be on yellow. No-go (blue, cars and their
+    margins, widened by the robot's half-width) is never crossed. The stretch before the
     path first reaches allowed ground (e.g. the robot starting off the road)
     is not checked.
 
@@ -435,7 +520,12 @@ def straight_reach(path, yellow, blue=None, obstacle=None, min_support=.5,
         return None
     _, support, nogo, _ = floor_fields(
         yellow, blue, obstacle, horizon_frac, half_width_px, blue_margin_px,
-        obstacle_margin_px, max_gap_px=max_gap_px)
+        obstacle_margin_px, max_gap_px=max_gap_px,
+        robot_half_width_px=robot_half_width_px, footprint_skip_frac=footprint_skip_frac)
+    if robot_half_width_px > 0:
+        # Judge "on the road" over the robot's whole width, tread to tread.
+        support = footprint_support(yellow, horizon_frac, robot_half_width_px,
+                                    footprint_skip_frac)
     allowed = (support >= min_support) & ~nogo
     h, w = allowed.shape
     pts = np.asarray(path, np.float64)

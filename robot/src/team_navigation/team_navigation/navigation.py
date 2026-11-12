@@ -26,7 +26,7 @@ from sensor_msgs.msg import Image, Imu
 from cv_bridge import CvBridge
 from course_robot_interfaces.msg import MotionRequest
 from team_navigation.vision import (color_masks, obstacle_mask, trace_paths, choose_path,
-                                    straight_reach)
+                                    straight_reach, body_px)
 from team_navigation.geometry import pixel_to_floor, homography_from_list
 from team_navigation.controller import pure_pursuit, pursue
 
@@ -54,9 +54,14 @@ class Navigation(Node):
             blue_margin_px=param('blue_margin_px', 6.),
             obstacle_margin_px=param('car_margin_px', 15.),
             blue_hug_gain=param('blue_hug_gain', .3),
-            turn_cost=param('turn_cost', .15))
+            turn_cost=param('turn_cost', .15),
+            robot_half_width_px=param('robot_half_width_px', 150.),
+            footprint_skip_frac=param('footprint_skip_frac', .1))
         self.steering = param('steering', 'taut')  # 'taut' or 'center'
-        self.taut_min_support = param('taut_min_support', .5)
+        self.taut_min_support = param('taut_min_support', .75)
+        # Rows (at image_scale) the path must reach beyond the footprint
+        # region before the robot moves; fewer means blocked -> stop.
+        self.min_clear_rows = param('footprint_min_clear_rows', 10)
         H = param('homography', [0.] * 9)  # all zeros means "not calibrated"
         self.H = homography_from_list(H) if any(H) else None
         publish_debug = param('publish_debug_image', True)
@@ -67,6 +72,7 @@ class Navigation(Node):
         self.paths = []  # every path seen this frame; trail_px is the one followed
         self.taut_px = None  # straight-line aim point for 'taut' steering
         self.used_taut = False
+        self.blocked = False  # the footprint cannot get past the rows right ahead
         self.previous_error = None
         self.create_subscription(Image, 'camera/image_raw', self.image_cb, qos_profile_sensor_data)
         self.create_subscription(Imu, 'imu/data', self.imu_cb, qos_profile_sensor_data)
@@ -120,7 +126,14 @@ class Navigation(Node):
         self.paths = trace_paths(self.mask, self.blue, self.cars, **self.path_settings)
         # At a split, stay with the path followed on the last frame.
         self.trail_px = choose_path(self.paths, previous)
-        if self.steering == 'taut' and self.trail_px:
+        # Blocked: the path stops within a few rows of where the robot's
+        # footprint starts being checked, i.e. the treads cannot get past
+        # blue/cars just ahead. Stop rather than drive the short stub.
+        h = self.mask.shape[0]
+        footprint_row = h * (1 - self.path_settings['footprint_skip_frac'])
+        self.blocked = bool(self.path_settings['robot_half_width_px'] > 0 and self.trail_px
+                            and self.trail_px[-1][1] > footprint_row - self.min_clear_rows)
+        if self.steering == 'taut' and self.trail_px and not self.blocked:
             found = straight_reach(self.trail_px, self.mask, self.blue, self.cars,
                                    self.taut_min_support, **self.path_settings)
             self.taut_px = found[1] if found else None
@@ -142,8 +155,11 @@ class Navigation(Node):
         return pixel_to_floor(observation, self.H), taut
 
     def choose_action(self, estimate):
-        """Follow the trail if enough of it is visible; None means stop."""
-        if estimate is None or len(estimate[0]) < self.min_points:
+        """Follow the trail if enough of it is visible; None means stop.
+
+        Also stops when the robot's footprint is blocked just ahead.
+        """
+        if estimate is None or self.blocked or len(estimate[0]) < self.min_points:
             return None
         return estimate
 
@@ -203,7 +219,9 @@ class Navigation(Node):
         labelled CAR: another car (no-go). Green dots: the trail being
         followed. Cyan dots: other paths seen (the other way round a split).
         Yellow line: the straight line used by 'taut' steering. White circle:
-        steering target. Top line: status and the request sent.
+        steering target. Grey dots either side of the followed path: where
+        the treads' outer edges would be (robot_half_width_px). Top line:
+        status and the request sent.
         """
         if self.debug_pub is None or self.mask is None or self.image is None:
             return
@@ -222,6 +240,13 @@ class Navigation(Node):
             if path is not self.trail_px:
                 for u, v in path[::2]:
                     cv2.circle(view, (int(u), int(v)), 1, (255, 255, 0), -1)
+        body = body_px(h, self.horizon_frac, self.path_settings['robot_half_width_px'],
+                       self.path_settings['footprint_skip_frac'])
+        for u, v in (self.trail_px or [])[::3]:
+            half = body[min(int(v), h - 1)]
+            if half > 0:
+                for edge in (u - half, u + half):
+                    cv2.circle(view, (int(edge), int(v)), 1, (200, 200, 200), -1)
         for u, v in self.trail_px or []:
             cv2.circle(view, (int(u), int(v)), 2, (0, 255, 0), -1)
         if self.target is not None and self.H is not None:
@@ -234,6 +259,8 @@ class Navigation(Node):
             status = 'NO CALIBRATION'
         elif not self.trail_px:
             status = 'NO PATH'
+        elif self.blocked:
+            status = 'BLOCKED (treads)'
         elif self.target is None:
             status = 'PATH TOO SHORT'
         else:

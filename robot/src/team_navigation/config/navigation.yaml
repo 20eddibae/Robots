@@ -9,9 +9,10 @@
     # when that point is nearer than lookahead_m. 'center': aim at the path
     # point lookahead_m ahead.
     steering: taut
-    # Yellow support (0..1, see vision.floor_fields) the straight line must
-    # keep: higher stays further from the road's edges, lower cuts corners.
-    taut_min_support: 0.5
+    # Fraction (0..1) of the robot's width, tread to tread, that must be on
+    # yellow all along the straight line (see vision.footprint_support):
+    # higher keeps the treads further inside the road, lower cuts corners.
+    taut_min_support: 0.75
     # Minimum aim distance (metres); the only aim distance for 'center'.
     lookahead_m: 0.20
     max_yaw_rate_rad_s: 1.0
@@ -41,7 +42,21 @@
     horizon_frac: 0.28
     # Widest stretch of non-yellow, non-blue floor a path may cross.
     max_gap_px: 120.0
-    # Clearance kept from blue and from other cars.
+    # Robot footprint: half the robot's width (22 cm / 2) in pixels at the
+    # bottom row, shrinking with distance like the sizes above. Paths and the
+    # taut line keep the robot's centre this far (+ the margins below) from
+    # blue and cars, so neither tread touches them. ESTIMATE from holding arms
+    # along the treads; measure with two sheets laid straight ahead (a letter
+    # sheet is 21.6 cm wide, about the robot's width). 0.0 = treat the robot
+    # as a point (old behaviour).
+    robot_half_width_px: 150.0
+    # The bottom fraction of the image where the footprint is not applied:
+    # the robot is already there, and its treads are outside the image.
+    footprint_skip_frac: 0.1
+    # Rows the path must reach beyond that region; fewer means the treads
+    # cannot get past blue/cars just ahead -> stop (viewer: BLOCKED (treads)).
+    footprint_min_clear_rows: 10
+    # Extra clearance kept from blue and from other cars, beyond the treads.
     blue_margin_px: 6.0
     car_margin_px: 15.0
     # Pull towards blue so turns round it are tight (0.0 = none).
