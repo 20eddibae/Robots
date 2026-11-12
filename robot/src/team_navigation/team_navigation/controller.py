@@ -45,10 +45,20 @@ def pure_pursuit(trail, speed_m_s=0.05, lookahead_m=0.30, max_yaw_rad_s=1.0,
     target = lookahead_point(trail, lookahead_m)
     if target is None:
         return 0., 0., None
-    x, y = target
-    d2 = x * x + y * y
-    yaw = speed_m_s * 2. * y / d2
+    return pursue(target, speed_m_s, max_yaw_rad_s)
+
+
+def pursue(target, speed_m_s=0.05, max_yaw_rad_s=1.0):
+    """Return (forward, yaw, target) driving the arc through floor point target.
+
+    yaw = speed * 2y / d^2, where d is the point's distance; positive turns
+    left. Zero motion if the point is not ahead of the robot.
+    """
+    x, y = float(target[0]), float(target[1])
+    if not x > 0:
+        return 0., 0., None
+    yaw = speed_m_s * 2. * y / (x * x + y * y)
     yaw = max(-max_yaw_rad_s, min(max_yaw_rad_s, yaw))
     if not (math.isfinite(speed_m_s) and math.isfinite(yaw)):
         return 0., 0., None
-    return float(speed_m_s), float(yaw), (float(x), float(y))
+    return float(speed_m_s), float(yaw), (x, y)

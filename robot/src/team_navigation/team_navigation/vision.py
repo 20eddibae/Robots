@@ -63,7 +63,17 @@ def path_region(mask, min_area=200, start_frac=0.33):
 
 def centerline(mask, step=5, min_width=10, max_jump=40, start_frac=0.33,
                min_area=200, gap_px=(9, 25)):
-    """Trace the middle of the yellow path from the bottom of the mask upward.
+    """Trace the middle of the yellow path; [(u, v), ...] ordered near -> far.
+
+    Same as corridor() but returns only each row's centre point.
+    """
+    return [(c, v) for c, v, _, _ in corridor(mask, step, min_width, max_jump,
+                                              start_frac, min_area, gap_px)]
+
+
+def corridor(mask, step=5, min_width=10, max_jump=40, start_frac=0.33,
+             min_area=200, gap_px=(9, 25)):
+    """Trace the yellow path from the bottom of the mask upward.
 
     Small gaps are bridged first (see close_gaps). Only the connected yellow
     region nearest the robot is then traced (see path_region), so patches of
@@ -74,8 +84,9 @@ def centerline(mask, step=5, min_width=10, max_jump=40, start_frac=0.33,
     do not move it. At a fork the outer edges span both branches, so the trail
     heads between them until they separate into different regions.
 
-    Returns a list of (u, v) pixel points ordered near -> far (empty if the
-    path is not found). Pixels are in the mask's own resolution.
+    Returns a list of (center_u, v, left_u, right_u) per sampled row, ordered
+    near -> far (empty if the path is not found): the row's centre and the
+    path's outer left and right edges. Pixels are in the mask's resolution.
 
     step:       rows between samples.
     min_width:  rows where the path is narrower than this (px) count as no path.
@@ -100,5 +111,42 @@ def centerline(mask, step=5, min_width=10, max_jump=40, start_frac=0.33,
         if prev is not None and abs(center - prev) > max_jump:
             break
         prev = float(center)
-        points.append((prev, v))
+        points.append((prev, v, int(xs[0]), int(xs[-1])))
     return points
+
+
+def farthest_visible(rows, start, margin_frac=0.15):
+    """Farthest centre point reachable in a straight line inside the path.
+
+    The "taut string": instead of following every wiggle of the centreline,
+    aim at the farthest centre point such that the straight segment from
+    `start` (the robot, e.g. bottom centre of the image) to it stays inside
+    the path's outer edges, minus margin_frac of the path's width on each
+    side, at every sampled row in between. On a straight path this aims far
+    ahead; on a curve the segment hugs the inside of the turn.
+
+    A straight line on the floor is a straight line in the image, so this
+    works in pixels without camera calibration.
+
+    rows:  corridor() output, near -> far.
+    start: (u, v) pixel the segment starts from.
+    Returns (index into rows, (u, v)) or None if not even the nearest
+    centre point can be reached (e.g. the robot is off the path).
+    """
+    su, sv = start
+    for i in range(len(rows) - 1, -1, -1):
+        tu, tv = rows[i][0], rows[i][1]
+        if tv >= sv:
+            continue
+        clear = True
+        for cu, v, left, right in rows[:i + 1]:
+            if v > sv:
+                continue
+            u = su + (tu - su) * (sv - v) / (sv - tv)
+            margin = margin_frac * (right - left)
+            if not left + margin <= u <= right - margin:
+                clear = False
+                break
+        if clear:
+            return i, (tu, tv)
+    return None

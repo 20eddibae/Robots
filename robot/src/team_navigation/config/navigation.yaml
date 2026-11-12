@@ -3,7 +3,14 @@
     # A suggested development setting, not permission to move the car.
     requested_forward_speed_m_s: 0.125
 
-    # Pure pursuit: aim at the trail point this far ahead (metres).
+    # Steering. 'taut': aim at the farthest trail point reachable in a
+    # straight line inside the yellow (ignores small wiggles, uses the path's
+    # width in turns); falls back to 'center' when that point is nearer than
+    # lookahead_m. 'center': aim at the trail point lookahead_m ahead.
+    steering: taut
+    # Keep the straight line this fraction of the path's width from each edge.
+    edge_margin_frac: 0.15
+    # Minimum aim distance (metres); the only aim distance for 'center'.
     lookahead_m: 0.20
     max_yaw_rate_rad_s: 1.0
     # Fewer visible trail points than this counts as "path lost" -> stop.

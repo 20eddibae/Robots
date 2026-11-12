@@ -20,9 +20,9 @@ from rclpy.executors import ExternalShutdownException
 from sensor_msgs.msg import Image, Imu
 from cv_bridge import CvBridge
 from course_robot_interfaces.msg import MotionRequest
-from team_navigation.vision import yellow_mask, centerline
+from team_navigation.vision import yellow_mask, corridor, farthest_visible
 from team_navigation.geometry import pixel_to_floor, homography_from_list
-from team_navigation.controller import pure_pursuit
+from team_navigation.controller import pure_pursuit, pursue
 
 
 class Navigation(Node):
@@ -38,13 +38,16 @@ class Navigation(Node):
         self.yellow_low = tuple(param('yellow_hsv_low', [18, 120, 140]))
         self.yellow_high = tuple(param('yellow_hsv_high', [35, 255, 255]))
         self.path_gap_px = tuple(param('path_gap_px', [9, 25]))
+        self.steering = param('steering', 'taut')  # 'taut' or 'center'
+        self.edge_margin_frac = param('edge_margin_frac', .15)
         H = param('homography', [0.] * 9)  # all zeros means "not calibrated"
         self.H = homography_from_list(H) if any(H) else None
         publish_debug = param('publish_debug_image', True)
 
         self.bridge = CvBridge()
         self.image = self.image_stamp = self.imu = None
-        self.mask = self.trail_px = self.target = None
+        self.mask = self.trail_px = self.target = self.taut_px = None
+        self.used_taut = False
         self.previous_error = None
         self.create_subscription(Image, 'camera/image_raw', self.image_cb, qos_profile_sensor_data)
         self.create_subscription(Imu, 'imu/data', self.imu_cb, qos_profile_sensor_data)
@@ -84,43 +87,65 @@ class Navigation(Node):
         """Return the path centerline as [(u, v), ...] mask pixels, or None.
 
         None means no usable image (missing or older than max_image_age_s).
-        An empty list means the image is fine but no path was found.
+        An empty list means the image is fine but no path was found. Also
+        finds the farthest centre point reachable in a straight line inside
+        the path (self.taut_px), used by 'taut' steering.
         """
-        self.mask = self.trail_px = None
+        self.mask = self.trail_px = self.taut_px = None
         if image is None or not self.image_is_fresh():
             return None
         self.mask = yellow_mask(image, self.yellow_low, self.yellow_high, self.image_scale)
-        self.trail_px = centerline(self.mask, gap_px=self.path_gap_px)
+        rows = corridor(self.mask, gap_px=self.path_gap_px)
+        self.trail_px = [(c, v) for c, v, _, _ in rows]
+        if self.steering == 'taut' and rows:
+            h, w = self.mask.shape
+            found = farthest_visible(rows, (w / 2, h), self.edge_margin_frac)
+            self.taut_px = found[1] if found else None
         return self.trail_px
 
     def update_estimate(self, observation, imu):
-        """Return the trail as an N x 2 array of floor (x fwd, y left) metres, or None.
+        """Return (trail, taut) in floor metres (x fwd, y left), or None.
 
-        Road-relative only: these are positions relative to the robot right
-        now, not a global position. The IMU is not used yet.
+        trail: N x 2 array of centreline points. taut: (x, y) of the farthest
+        straight-line-reachable centre point, or None. Road-relative only:
+        positions relative to the robot right now, not a global position.
+        The IMU is not used yet.
         """
         if not observation or self.H is None:
             return None
-        return pixel_to_floor(observation, self.H)
+        taut = None
+        if self.taut_px is not None:
+            taut = tuple(pixel_to_floor([self.taut_px], self.H)[0])
+        return pixel_to_floor(observation, self.H), taut
 
     def choose_action(self, estimate):
         """Follow the trail if enough of it is visible; None means stop."""
-        if estimate is None or len(estimate) < self.min_points:
+        if estimate is None or len(estimate[0]) < self.min_points:
             return None
         return estimate
 
     def compute_motion(self, action):
         """Return (forward m/s, left-turn rad/s); no action means zero motion.
 
-        Pure pursuit toward the trail point about lookahead_m ahead. The
-        safety node converts this to treads using the measured track width
-        and scales both treads together if either exceeds the speed profile.
+        'taut': head for the farthest centre point reachable in a straight
+        line inside the path, so small wiggles in the centreline are ignored
+        and turns use the path's width. Falls back to the 'center' behaviour
+        when that point is nearer than lookahead_m or not found.
+        'center': pure pursuit toward the centreline point lookahead_m ahead.
+        The safety node converts this to treads using the measured track
+        width and scales both treads together if either exceeds the profile.
         """
-        self.target = None
+        self.target, self.used_taut = None, False
         if action is None:
             return 0., 0.
+        trail, taut = action
+        if taut is not None and math.hypot(*taut) >= self.lookahead_m:
+            forward, yaw, self.target = pursue(taut, self.target_speed, self.max_yaw)
+            self.used_taut = self.target is not None
+            if self.used_taut:
+                return forward, yaw
         forward, yaw, self.target = pure_pursuit(
-            action, self.target_speed, self.lookahead_m, self.max_yaw, self.min_points)
+            trail, self.target_speed, self.lookahead_m, self.max_yaw, self.min_points)
         return forward, yaw
 
     def tick(self):
@@ -152,7 +177,8 @@ class Navigation(Node):
         """Publish the camera view with what the code sees drawn on top.
 
         Magenta tint: pixels counted as yellow. Green dots: traced trail.
-        White circle: lookahead target. Top line: status and the request sent.
+        White circle: steering target. Cyan line: the straight line used by
+        'taut' steering. Top line: status and the request sent.
         """
         if self.debug_pub is None or self.mask is None or self.image is None:
             return
@@ -164,6 +190,8 @@ class Navigation(Node):
             cv2.circle(view, (int(u), int(v)), 2, (0, 255, 0), -1)
         if self.target is not None and self.H is not None:
             u, v = pixel_to_floor([self.target], np.linalg.inv(self.H))[0]
+            if self.used_taut:
+                cv2.line(view, (w // 2, h - 1), (int(u), int(v)), (255, 255, 0), 2)
             cv2.circle(view, (int(u), int(v)), 6, (255, 255, 255), 2)
         if self.H is None:
             status = 'NO CALIBRATION'
@@ -172,7 +200,7 @@ class Navigation(Node):
         elif self.target is None:
             status = 'PATH TOO SHORT'
         else:
-            status = 'FOLLOWING'
+            status = 'FOLLOWING (taut)' if self.used_taut else 'FOLLOWING'
         text = f'{status}  v={forward:.2f} yaw={yaw:+.2f}'
         for color, thickness in (((0, 0, 0), 3), ((255, 255, 255), 1)):
             cv2.putText(view, text, (4, 14), cv2.FONT_HERSHEY_SIMPLEX, .4,
