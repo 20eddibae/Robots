@@ -62,9 +62,47 @@ The repository is public, so no GitHub sign-in is needed. If the Jetson has no i
 
 The lab Jetsons already have their commissioned OS, firmware, ROS Jazzy, `~/ros-venv`, identity/network settings and standalone camera/OLED services. [Prerequisite checks](docs/SETUP.md#check-the-commissioned-prerequisites) verify those before building. You build the ROS baseline yourself. If a prerequisite check fails, ask the teaching staff; it is not something to fix by rebuilding your code.
 
-## Our navigation code
+## Team navigation (submitted code)
 
-Our yellow-road follower (modes, speeds, how to run it) is described in [robot/src/team_navigation/README.md](robot/src/team_navigation/README.md). Day-to-day commands: [docs/CHEATSHEET.md](docs/CHEATSHEET.md).
+Submitted version: `main` of this repository. The team package is `robot/src/team_navigation`. Parameters live in `config/navigation.yaml`. Detail and the file list: [robot/src/team_navigation/README.md](robot/src/team_navigation/README.md). Day-to-day commands: [docs/CHEATSHEET.md](docs/CHEATSHEET.md).
+
+`navigation` is the only team node. Every 0.05 s it masks the camera for yellow, traces a path, maps pixels to the floor with the homography in `geometry.py`, and publishes `navigation/request` (forward m/s, left-turn rad/s). The supplied safety node is the only motor publisher. Hold RB to drive; A or releasing the bumper stops. Images older than 0.3 s, a lost path, or an all-zero homography request zero motion. The IMU is not used.
+
+Default in `navigation.yaml`: `perception: yellow` (yellow-only trace in `vision_yellow.py`) and `steering: taut` (aim along the longest straight line that stays inside the road; otherwise pure pursuit at `lookahead_m`). `perception:=blue_aware` uses `vision.py` to stay off blue paper and other cars and to keep the same side of a fork. `footprint_check:=true` (blue-aware only) stops if the treads cannot fit. No extra Python packages beyond the Jetson venv (OpenCV, NumPy, ROS 2 Jazzy).
+
+Build and run on the Jetson, after [setup](docs/SETUP.md). In a fresh terminal:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/a2r-student/robot/install/setup.bash
+source ~/ros-venv/bin/activate
+source /etc/a2r-robot/robot.sh
+cd ~/a2r-student/robot
+python -m colcon build --symlink-install --packages-select team_navigation
+```
+
+Terminal A (RVR on; motors stay off until you set `motion_enabled:=true` and hold RB):
+
+```bash
+systemctl --user stop rvr-camera.service
+ros2 launch a2r_robot robot.launch.py namespace:="$ROBOT_NAMESPACE" motion_enabled:=false
+```
+
+Terminal B:
+
+```bash
+ros2 launch team_navigation team.launch.py namespace:="$ROBOT_NAMESPACE"
+```
+
+One-run overrides (blank means the yaml value): `perception:=blue_aware`, `steering:=center`, `footprint_check:=true`, `speed:=0.25`, `max_yaw:=3.0`, `explore:=false`.
+
+Representative check, motion still disabled: the node logs the mode and speeds, `ros2 topic echo /$ROBOT_NAMESPACE/navigation/request` shows finite speeds or zeros, and `navigation/debug_image` shows magenta on yellow and a green trail. With a saved photo and no ROS, from `robot/src`:
+
+```bash
+python3 -c "import cv2; from team_navigation import vision_yellow as vy; m=vy.yellow_mask(cv2.imread('photo.jpg'),(18,60,140),(35,255,255)); print(len(vy.corridor(m, jump_px=80)))"
+```
+
+Limitations: the homography in the yaml is a rough placeholder, so metre lookahead and turn rate are approximate. Yellow mode does not treat blue as forbidden and, while both fork branches are one region, aims between them. `robot_half_width_px` is an estimate. There is no lap memory. The course tests of the unmodified zero-motion starter fail once this node drives; that is expected.
 
 ## Connection details
 
