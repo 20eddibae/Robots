@@ -62,6 +62,10 @@ The repository is public, so no GitHub sign-in is needed. If the Jetson has no i
 
 The lab Jetsons already have their commissioned OS, firmware, ROS Jazzy, `~/ros-venv`, identity/network settings and standalone camera/OLED services. [Prerequisite checks](docs/SETUP.md#check-the-commissioned-prerequisites) verify those before building. You build the ROS baseline yourself. If a prerequisite check fails, ask the teaching staff; it is not something to fix by rebuilding your code.
 
+## Our navigation code
+
+Our yellow-road follower (modes, speeds, how to run it) is described in [robot/src/team_navigation/README.md](robot/src/team_navigation/README.md). Day-to-day commands: [docs/CHEATSHEET.md](docs/CHEATSHEET.md).
+
 ## Connection details
 
 | Connection | Name / username | Password |
