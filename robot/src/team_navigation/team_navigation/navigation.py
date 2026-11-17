@@ -23,6 +23,8 @@ homography has not been calibrated. Motion still passes through the supplied
 safety node (RB held, measured track_width_m).
 """
 import math
+import re
+import time
 import cv2
 import numpy as np
 import rclpy
@@ -30,10 +32,11 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy
 from rclpy.executors import ExternalShutdownException
 from sensor_msgs.msg import Image, Imu
+from std_msgs.msg import String
 from cv_bridge import CvBridge
 from course_robot_interfaces.msg import MotionRequest
 from team_navigation.vision import (color_masks, obstacle_mask, trace_paths, choose_path,
-                                    straight_reach, body_px)
+                                    straight_reach, body_px, drop_specks)
 from team_navigation import vision_yellow
 from team_navigation.geometry import pixel_to_floor, homography_from_list
 from team_navigation.controller import pure_pursuit, pursue
@@ -43,13 +46,29 @@ class Navigation(Node):
     def __init__(self):
         super().__init__('navigation')
         param = lambda name, default: self.declare_parameter(name, default).value
-        self.target_speed = param('requested_forward_speed_m_s', .05)
+        # Forward speed: the controller's profile limit (Low/Medium/High, read
+        # from safety/status), but never more than this.
+        # Speed for each gamepad profile (Low, Medium, High), never above the
+        # profile's own tread limit, nor above requested_forward_speed_m_s.
+        self.profile_speeds = dict(zip(('Low', 'Medium', 'High'),
+                                       param('profile_speeds_m_s', [.15, .75, .8])))
+        self.target_speed = param('requested_forward_speed_m_s', 1.4)
+        self.tread_limit = None  # from safety/status; None until heard
+        self.profile = None  # 'Low' / 'Medium' / 'High' from safety/status
+        # Explore: when no usable path is found and blue is in the way,
+        # turn slowly clockwise on the spot until a path appears.
+        self.explore = bool(param('explore_when_blocked', True))
+        self.explore_yaw = param('explore_yaw_rate_rad_s', .5)
+        self.explore_min_blue = param('explore_min_blue_frac', .02)
+        self.explore_max_s = param('explore_max_s', 15.)
+        self.explore_started = None  # time.monotonic() when exploring began
+        self.exploring = False
         self.lookahead_m = param('lookahead_m', .30)
         self.max_yaw = param('max_yaw_rate_rad_s', 1.0)
         self.min_points = param('min_trail_points', 3)
         self.max_image_age = param('max_image_age_s', .3)
         self.image_scale = param('image_scale', .25)
-        self.yellow_low = tuple(param('yellow_hsv_low', [18, 120, 140]))
+        self.yellow_low = tuple(param('yellow_hsv_low', [18, 60, 140]))
         self.yellow_high = tuple(param('yellow_hsv_high', [35, 255, 255]))
         self.blue_low = tuple(param('blue_hsv_low', [95, 60, 40]))
         self.blue_high = tuple(param('blue_hsv_high', [130, 255, 255]))
@@ -61,12 +80,14 @@ class Navigation(Node):
         self.footprint_check = bool(param('footprint_check', False))
         # perception: yellow (best-path) settings
         self.path_gap_px = tuple(param('path_gap_px', [9, 25]))
+        self.path_jump_px = param('path_jump_px', 80)
         self.edge_margin_frac = param('edge_margin_frac', .15)
         # perception: blue_aware settings
         self.horizon_frac = param('horizon_frac', .28)
+        self.blue_min_area_px = param('blue_min_area_px', 150.)
         self.path_settings = dict(
             horizon_frac=self.horizon_frac,
-            max_gap_px=param('max_gap_px', 120.),
+            max_gap_px=param('max_gap_px', 180.),
             blue_margin_px=param('blue_margin_px', 6.),
             obstacle_margin_px=param('car_margin_px', 15.),
             blue_hug_gain=param('blue_hug_gain', .3),
@@ -95,14 +116,16 @@ class Navigation(Node):
         self.previous_error = None
         self.create_subscription(Image, 'camera/image_raw', self.image_cb, qos_profile_sensor_data)
         self.create_subscription(Imu, 'imu/data', self.imu_cb, qos_profile_sensor_data)
+        self.create_subscription(String, 'safety/status', self.status_cb, 1)
         self.publisher = self.create_publisher(
             MotionRequest, 'navigation/request',
             QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
         self.debug_pub = (self.create_publisher(Image, 'navigation/debug_image', 1)
                           if publish_debug else None)
         self.create_timer(.05, self.tick)
-        self.get_logger().info(f'mode: {self.mode_text()}, '
-                               f'speed {self.target_speed} m/s')
+        self.get_logger().info(f'mode: {self.mode_text()}, speed: controller '
+                               f'Low/Medium/High {self.profile_speeds} m/s, '
+                               f'at most {self.target_speed} m/s')
         if self.H is None:
             self.get_logger().warning(
                 'homography not calibrated: requesting zero motion '
@@ -119,6 +142,27 @@ class Navigation(Node):
 
     def imu_cb(self, msg):
         self.imu = msg
+
+    def status_cb(self, msg):
+        """Remember the speed profile and its tread limit, from e.g.
+        'speed_profile=Medium; tread_limit=0.60 m/s'."""
+        found = re.search(r'tread_limit=([0-9.]+)', msg.data)
+        if found:
+            self.tread_limit = float(found.group(1))
+        found = re.search(r'speed_profile=(\w+)', msg.data)
+        if found:
+            self.profile = found.group(1)
+
+    def speed(self):
+        """Forward speed to request: profile_speeds_m_s for the gamepad's
+        profile, but no more than the profile's tread limit (the safety node
+        would cap it there anyway) or requested_forward_speed_m_s. Low (0.15)
+        until the safety node is heard. In a turn the outer tread goes faster
+        than this and the safety node slows both treads together, keeping
+        the turn's shape."""
+        limit = self.tread_limit if self.tread_limit is not None else .15
+        wanted = self.profile_speeds.get(self.profile, limit)
+        return min(wanted, limit, self.target_speed)
 
     def image_is_fresh(self):
         """True if the latest image is no older than max_image_age_s."""
@@ -152,6 +196,7 @@ class Navigation(Node):
         self.mask, self.blue, car_coloured = color_masks(
             image, self.yellow_low, self.yellow_high, self.blue_low, self.blue_high,
             self.car_low, self.car_high, self.image_scale)
+        self.blue = drop_specks(self.blue, self.horizon_frac, self.blue_min_area_px)
         self.cars = obstacle_mask(car_coloured, self.horizon_frac)
         self.paths = trace_paths(self.mask, self.blue, self.cars, **self.path_settings)
         # At a split, stay with the path followed on the last frame.
@@ -173,8 +218,14 @@ class Navigation(Node):
         """perception: yellow -- exactly the best-path branch's tracing."""
         self.mask = vision_yellow.yellow_mask(image, self.yellow_low, self.yellow_high,
                                               self.image_scale)
-        self.blue = self.cars = np.zeros_like(self.mask)  # not detected in this mode
-        rows = vision_yellow.corridor(self.mask, gap_px=self.path_gap_px)
+        # Blue is not avoided in this mode, only detected for exploring.
+        _, blue, _ = color_masks(image, self.yellow_low, self.yellow_high, self.blue_low,
+                                 self.blue_high, self.car_low, self.car_high, self.image_scale)
+        self.blue = drop_specks(blue, self.horizon_frac, self.blue_min_area_px)
+        self.cars = np.zeros_like(self.mask)
+        rows = vision_yellow.corridor(self.mask, gap_px=self.path_gap_px,
+                                      jump_px=self.path_jump_px,
+                                      horizon_frac=self.horizon_frac)
         self.trail_px = [(c, v) for c, v, _, _ in rows]
         self.paths = [self.trail_px] if self.trail_px else []
         if self.steering == 'taut' and rows:
@@ -223,12 +274,45 @@ class Navigation(Node):
             return 0., 0.
         trail, taut = action
         if taut is not None and math.hypot(*taut) >= self.lookahead_m:
-            forward, yaw, self.target = pursue(taut, self.target_speed, self.max_yaw)
+            forward, yaw, self.target = pursue(taut, self.speed(), self.max_yaw)
             self.used_taut = self.target is not None
             if self.used_taut:
                 return forward, yaw
         forward, yaw, self.target = pure_pursuit(
-            trail, self.target_speed, self.lookahead_m, self.max_yaw, self.min_points)
+            trail, self.speed(), self.lookahead_m, self.max_yaw, self.min_points)
+        return forward, yaw
+
+    def blue_ahead(self):
+        """True if at least explore_min_blue_frac of the floor below the
+        horizon is blue."""
+        if self.blue is None:
+            return False
+        h = self.blue.shape[0]
+        floor = self.blue[int(h * self.horizon_frac):]
+        return floor.size > 0 and floor.mean() >= self.explore_min_blue
+
+    def explore_motion(self, forward, yaw):
+        """Turn slowly clockwise on the spot while stuck because of blue.
+
+        Starts when there is a fresh, calibrated image but no usable path
+        (NO PATH / PATH TOO SHORT / BLOCKED) and blue is in view. Keeps
+        turning, even once the blue has turned out of view, until a path is
+        followed again, for at most explore_max_s (then stops until a path
+        is found). Otherwise returns (forward, yaw) unchanged.
+        """
+        stuck = (self.explore and self.target is None and self.mask is not None
+                 and self.H is not None)
+        if not stuck:
+            self.exploring, self.explore_started = False, None
+            return forward, yaw
+        if not self.exploring and self.blue_ahead():
+            self.exploring = True
+            if self.explore_started is None:
+                self.explore_started = time.monotonic()
+        if self.exploring and time.monotonic() - self.explore_started > self.explore_max_s:
+            self.exploring = False  # gave up; explore_started stays set until a path is found
+        if self.exploring:
+            return 0., -abs(self.explore_yaw)  # negative yaw = clockwise (right)
         return forward, yaw
 
     def tick(self):
@@ -237,7 +321,7 @@ class Navigation(Node):
             observation = self.process_image(self.image)
             estimate = self.update_estimate(observation, self.imu)
             action = self.choose_action(estimate)
-            forward, yaw = self.compute_motion(action)
+            forward, yaw = self.explore_motion(*self.compute_motion(action))
             if not all(math.isfinite(v) for v in (forward, yaw)):
                 raise ValueError('controller returned a nonfinite command')
             self.previous_error = None
@@ -304,6 +388,8 @@ class Navigation(Node):
             cv2.circle(view, (int(u), int(v)), 6, (255, 255, 255), 2)
         if self.H is None:
             status = 'NO CALIBRATION'
+        elif self.exploring:
+            status = 'EXPLORING (blue: turning right)'
         elif not self.trail_px:
             status = 'NO PATH'
         elif self.blocked:

@@ -9,7 +9,7 @@ import numpy as np
 
 # OpenCV HSV ranges: H 0-179, S 0-255, V 0-255. Yellow sits around H 20-35.
 # Tune these on real frames from the robot's camera and lighting.
-YELLOW_LOW = (18, 120, 140)
+YELLOW_LOW = (18, 60, 140)
 YELLOW_HIGH = (35, 255, 255)
 
 
@@ -46,6 +46,19 @@ def close_gaps(mask, gap_px=(9, 25)):
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
 
+def _start_label(stats, height, min_area=200, start_frac=0.33):
+    """Label of the largest region of at least min_area pixels whose lowest
+    row lies in the bottom start_frac of the image, or None."""
+    bottom_limit = height * (1 - start_frac)
+    best, best_area = None, min_area - 1
+    for i in range(1, len(stats)):  # label 0 is background
+        area = stats[i, cv2.CC_STAT_AREA]
+        lowest_row = stats[i, cv2.CC_STAT_TOP] + stats[i, cv2.CC_STAT_HEIGHT] - 1
+        if lowest_row >= bottom_limit and area > best_area:
+            best, best_area = i, area
+    return best
+
+
 def path_region(mask, min_area=200, start_frac=0.33):
     """Keep only the connected yellow region the robot is on (drops noise).
 
@@ -53,31 +66,49 @@ def path_region(mask, min_area=200, start_frac=0.33):
     lies in the bottom start_frac of the image, i.e. the yellow nearest the
     robot. Returns a 0/1 mask; all zeros if no region qualifies.
     """
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    bottom_limit = mask.shape[0] * (1 - start_frac)
-    best, best_area = None, min_area - 1
-    for i in range(1, count):  # label 0 is background
-        area = stats[i, cv2.CC_STAT_AREA]
-        lowest_row = stats[i, cv2.CC_STAT_TOP] + stats[i, cv2.CC_STAT_HEIGHT] - 1
-        if lowest_row >= bottom_limit and area > best_area:
-            best, best_area = i, area
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    best = _start_label(stats, mask.shape[0], min_area, start_frac)
     if best is None:
         return np.zeros_like(mask)
     return (labels == best).astype(np.uint8)
 
 
+def _row_span(region_row, min_width):
+    """(left, right) outer edges of a 0/1 row, or None if narrower than min_width."""
+    xs = np.flatnonzero(region_row)
+    if len(xs) == 0 or xs[-1] - xs[0] + 1 < min_width:
+        return None
+    return int(xs[0]), int(xs[-1])
+
+
+def _jump(labels, stats, v, max_rows, center, min_area, min_width, max_jump):
+    """Look up to max_rows rows above row v for a yellow region (possibly the
+    one already followed) that carries on where the trail was heading: its
+    outer edges in that row centred within max_jump px of `center`.
+    Returns (label, row) or None."""
+    for row in range(v, max(v - int(max_rows), 0) - 1, -1):
+        for label in np.unique(labels[row]):
+            if label == 0 or stats[label, cv2.CC_STAT_AREA] < min_area:
+                continue
+            span = _row_span(labels[row] == label, min_width)
+            if span and abs((span[0] + span[1]) / 2 - center) <= max_jump:
+                return int(label), row
+    return None
+
+
 def centerline(mask, step=5, min_width=10, max_jump=40, start_frac=0.33,
-               min_area=200, gap_px=(9, 25)):
+               min_area=200, gap_px=(9, 25), jump_px=0, horizon_frac=.28):
     """Trace the middle of the yellow path; [(u, v), ...] ordered near -> far.
 
     Same as corridor() but returns only each row's centre point.
     """
     return [(c, v) for c, v, _, _ in corridor(mask, step, min_width, max_jump,
-                                              start_frac, min_area, gap_px)]
+                                              start_frac, min_area, gap_px,
+                                              jump_px, horizon_frac)]
 
 
 def corridor(mask, step=5, min_width=10, max_jump=40, start_frac=0.33,
-             min_area=200, gap_px=(9, 25)):
+             min_area=200, gap_px=(9, 25), jump_px=0, horizon_frac=.28):
     """Trace the yellow path from the bottom of the mask upward.
 
     Small gaps are bridged first (see close_gaps). Only the connected yellow
@@ -100,23 +131,45 @@ def corridor(mask, step=5, min_width=10, max_jump=40, start_frac=0.33,
     start_frac: the trail must start within this bottom fraction of the image.
     min_area:   smallest region (px) that counts as path.
     gap_px:     (sideways, along-path) gaps to bridge; (0, 0) disables.
+    jump_px:    where the trail would end (the region stops, or its centre
+                swings more than max_jump sideways, e.g. because another
+                sheet joins it at the image edge), look up to this many rows
+                further (at the bottom row, shrinking with distance towards
+                the horizon at horizon_frac of the image height) for yellow
+                in line with the trail (within max_jump), and carry on along
+                it: crosses wider gaps between sheets than gap_px, without
+                merging regions side by side. 0 = off.
     """
     if mask is None:
         return []
-    mask = path_region(close_gaps(mask, gap_px), min_area, start_frac)
-    height = mask.shape[0]
+    closed = close_gaps(mask, gap_px)
+    height = closed.shape[0]
+    _, labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+    current = _start_label(stats, height, min_area, start_frac)
+    if current is None:
+        return []
+    horizon = horizon_frac * height
     points, prev = [], None
-    for v in range(height - 1, -1, -step):
-        xs = np.flatnonzero(mask[v])
-        if len(xs) == 0 or xs[-1] - xs[0] + 1 < min_width:
-            if prev is None and v >= height * (1 - start_frac):
+    v = height - 1
+    while v >= 0:
+        span = _row_span(labels[v] == current, min_width)
+        if span is None and prev is None:
+            if v >= height * (1 - start_frac):
+                v -= step
                 continue  # still looking for where the path begins
-            break  # path ended (or was never found near the robot)
-        center = (xs[0] + xs[-1]) / 2
-        if prev is not None and abs(center - prev) > max_jump:
-            break
+            break  # never found near the robot
+        if prev is not None and (span is None or abs((span[0] + span[1]) / 2 - prev) > max_jump):
+            scale = min(max((v - horizon) / max(height - 1 - horizon, 1.), 0.), 1.)
+            found = _jump(labels, stats, v, jump_px * scale, prev,
+                          min_area, min_width, max_jump) if jump_px > 0 else None
+            if found is None:
+                break  # path ended
+            current, v = found
+            continue
+        center = (span[0] + span[1]) / 2
         prev = float(center)
-        points.append((prev, v, int(xs[0]), int(xs[-1])))
+        points.append((prev, v, span[0], span[1]))
+        v -= step
     return points
 
 

@@ -1,7 +1,11 @@
 /**:
   ros__parameters:
-    # A suggested development setting, not permission to move the car.
-    requested_forward_speed_m_s: 0.125
+    # Forward speed for each gamepad profile (Y button), [Low, Medium, High].
+    # The safety node caps each profile's treads at Low 0.15, Medium 0.60,
+    # High 1.40 m/s, so Medium's 0.75 actually drives at 0.60.
+    profile_speeds_m_s: [0.15, 0.75, 0.8]
+    # Overall cap on top of that. Launch with speed:=0.3 to cap a run lower.
+    requested_forward_speed_m_s: 1.4
 
     # ---- Mode switches. Override for one run without editing this file:
     #   ros2 launch team_navigation team.launch.py namespace:="$ROBOT_NAMESPACE" \
@@ -29,7 +33,17 @@
     taut_min_support: 0.75
     # Minimum aim distance (metres); the only aim distance for 'center'.
     lookahead_m: 0.20
-    max_yaw_rate_rad_s: 1.0
+    # Turn-rate cap. Turns get wider as speed rises (radius >= speed / this):
+    # 3.0 allows ~0.2 m radius at Medium, ~0.5 m at High.
+    max_yaw_rate_rad_s: 3.0
+    # Explore: with no usable path (NO PATH / PATH TOO SHORT / BLOCKED) and
+    # blue covering at least explore_min_blue_frac of the floor in view, turn
+    # on the spot clockwise (right) at explore_yaw_rate_rad_s until a path is
+    # found; give up (stop) after explore_max_s. Both modes detect blue for this.
+    explore_when_blocked: true
+    explore_yaw_rate_rad_s: 0.5
+    explore_min_blue_frac: 0.02
+    explore_max_s: 15.0
     # Fewer visible trail points than this counts as "path lost" -> stop.
     min_trail_points: 3
 
@@ -41,11 +55,17 @@
     image_scale: 0.25
     # V min 140: under the lab lighting the wall has the paper's hue and
     # saturation but is darker (paper V ~205, wall V ~96).
-    yellow_hsv_low: [18, 120, 140]
+    # S min 60: pale sheets measure S ~70-110 (was 120, which missed them);
+    # grey carpet is S < 35.
+    yellow_hsv_low: [18, 60, 140]
     yellow_hsv_high: [35, 255, 255]
     # perception: yellow -- merge yellow groups closer than [sideways,
     # along-path] pixels (at image_scale) before tracing. [0, 0] = off.
     path_gap_px: [9, 25]
+    # perception: yellow -- where the yellow ends, look up to this many rows
+    # further (at the bottom row, fewer with distance) for the next sheet in
+    # line with the trail and carry on along it. 0 = stop at every gap.
+    path_jump_px: 80
 
     # ---- perception: blue_aware settings (ignored by 'yellow') ----
     # Blue paper is no-go: a path never touches it.
@@ -54,13 +74,16 @@
     # Other cars (light grey body: any hue, low S, bright) are no-go too.
     car_hsv_low: [0, 0, 150]
     car_hsv_high: [179, 80, 255]
+    # Ignore blue blobs smaller than this (pixels at the bottom row, fewer
+    # with distance): specks on carpet/tape, not paper. 0 = keep all.
+    blue_min_area_px: 150.0
 
     # Path estimation (vision.trace_paths). Sizes are in pixels at image_scale
     # as seen at the BOTTOM row; they shrink automatically with distance.
     # Row where the floor would vanish, as a fraction of image height (0 = top).
     horizon_frac: 0.28
     # Widest stretch of non-yellow, non-blue floor a path may cross.
-    max_gap_px: 120.0
+    max_gap_px: 180.0
     # Robot footprint: half the robot's width (22 cm / 2) in pixels at the
     # bottom row, shrinking with distance like the sizes above. Paths and the
     # taut line keep the robot's centre this far (+ the margins below) from

@@ -34,7 +34,7 @@ import numpy as np
 # blue around H 95-130. The other cars' bodies are light grey: any hue, low
 # saturation, bright (the carpet is darker, the paper far more saturated).
 # Tune on real frames from the robot's camera and lighting.
-YELLOW_LOW = (18, 120, 140)
+YELLOW_LOW = (18, 60, 140)
 YELLOW_HIGH = (35, 255, 255)
 BLUE_LOW = (95, 60, 40)
 BLUE_HIGH = (130, 255, 255)
@@ -88,9 +88,10 @@ def color_masks(image, yellow_low=YELLOW_LOW, yellow_high=YELLOW_HIGH,
     if image is None:
         return None, None, None
     hsv = _hsv(image, scale)
-    return (_in_range(hsv, yellow_low, yellow_high),
-            _in_range(hsv, blue_low, blue_high),
-            _in_range(hsv, car_low, car_high))
+    yellow = _in_range(hsv, yellow_low, yellow_high)
+    # Pale paper is also bright and weakly coloured: yellow is never a car.
+    return (yellow, _in_range(hsv, blue_low, blue_high),
+            _in_range(hsv, car_low, car_high) & (1 - yellow))
 
 
 def floor_scale(height, horizon_frac=.28):
@@ -132,6 +133,26 @@ def obstacle_mask(car_coloured, horizon_frac=.28, min_area_px=600., reach_px=12.
                 and cv2.contourArea(contour) >= min_area_px * size * size):
             cv2.fillConvexPoly(result, cv2.convexHull(contour), 1)
     return result
+
+
+def drop_specks(mask, horizon_frac=.28, min_area_px=150.):
+    """Remove blobs too small to be real paper at their distance.
+
+    A blob is kept when it has at least min_area_px pixels x scale^2 at its
+    lowest row (a sheet twice as far away covers a quarter of the pixels;
+    at least 2 px). Carpet and tape produce scattered blue specks of a few
+    pixels, which would otherwise count as no-go and, with the footprint
+    check, block a whole row. Returns a 0/1 mask (None if mask is None).
+    """
+    if mask is None or min_area_px <= 0 or not mask.any():
+        return mask
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    scale = floor_scale(mask.shape[0], horizon_frac)
+    bottom = stats[1:, cv2.CC_STAT_TOP] + stats[1:, cv2.CC_STAT_HEIGHT] - 1
+    needed = np.maximum(min_area_px * scale[bottom] ** 2, 2.)
+    keep = np.zeros(count, np.uint8)
+    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= needed
+    return keep[labels]
 
 
 def _off_road_distance(on_road, scale):
