@@ -70,6 +70,21 @@ ros2 launch a2r_robot robot.launch.py namespace:="$ROBOT_NAMESPACE" motion_enabl
 ros2 launch team_navigation team.launch.py namespace:="$ROBOT_NAMESPACE"
 ```
 
+Pick a mode for one run (left out = `navigation.yaml`; no rebuild needed, just restart B):
+
+```bash
+# best-path behaviour (the default): yellow only, taut steering
+ros2 launch team_navigation team.launch.py namespace:="$ROBOT_NAMESPACE" perception:=yellow
+# teammate's blue/car-aware paths, taut steering, treads not checked
+ros2 launch team_navigation team.launch.py namespace:="$ROBOT_NAMESPACE" perception:=blue_aware
+# ... plus the tread check (stops with BLOCKED (treads))
+ros2 launch team_navigation team.launch.py namespace:="$ROBOT_NAMESPACE" perception:=blue_aware footprint_check:=true
+# any mode with plain look-ahead steering and/or a different speed
+ros2 launch team_navigation team.launch.py namespace:="$ROBOT_NAMESPACE" steering:=center speed:=0.25
+```
+
+The viewer's second line on the right shows the active mode.
+
 ## Calibration record (jetson3)
 
 **Track width: `0.2197` m.** Pass `track_width_m:=0.2197` on every base launch; it isn't saved on the robot, and the default 0 blocks autonomy. With motors disabled, the safety line should show `separation=0.220 m`.
@@ -158,6 +173,10 @@ To go again after a stop: release everything, center the sticks, then hold RB.
 | Parameter                            | Effect                                                                                                                                                                                         |
 | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `requested_forward_speed_m_s`        | Forward speed                                                                                                                                                                                  |
+| `perception` | `yellow` (best-path, ignores blue/cars) or `blue_aware`. Launch arg `perception:=`. |
+| `steering` | `taut` or `center`. Launch arg `steering:=`. |
+| `footprint_check` | `blue_aware` only: keep treads off blue/cars (`robot_half_width_px`). Launch arg `footprint_check:=true`. |
+| `edge_margin_frac`, `path_gap_px` | `yellow` only: taut line's distance from the edges; gaps bridged between sheets. |
 | `lookahead_m`                        | Zig-zags: increase. Cuts corners: decrease.                                                                                                                                                    |
 | `max_yaw_rate_rad_s`                 | Turn rate limit                                                                                                                                                                                |
 | `yellow_hsv_low` / `yellow_hsv_high` | Yellow threshold (H 0-179), now `[18, 120, 140]`-`[35, 255, 255]`. Use the live view's box HSV readout on the paper. Misses yellow: lower S/V minimums. Carpet counts as yellow: raise S minimum. Wall counts as yellow: raise V minimum (lab wall V ~96, paper ~205). |

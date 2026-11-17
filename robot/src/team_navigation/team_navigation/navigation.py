@@ -1,6 +1,13 @@
 """Follow a yellow floor path: camera -> mask -> trail -> floor -> pure pursuit.
 
-Pipeline (each step is a ROS-free module that can be tested offline):
+Switchable with parameters (navigation.yaml, or launch arguments):
+  perception       'yellow': best-path's yellow-only tracing (vision_yellow);
+                   'blue_aware': yellow road, blue and other cars no-go (vision)
+  steering         'taut' or 'center'
+  footprint_check  blue_aware only: keep both treads off blue/cars and stop
+                   (BLOCKED) when they cannot get past just ahead
+
+Pipeline (perception: blue_aware) (each step is a ROS-free module that can be tested offline):
   process_image   vision.color_masks + vision.trace_paths -> trail in pixels
                   (yellow = road, blue and other cars = no-go; maps both ways
                   round a split and keeps following the one chosen before)
@@ -27,6 +34,7 @@ from cv_bridge import CvBridge
 from course_robot_interfaces.msg import MotionRequest
 from team_navigation.vision import (color_masks, obstacle_mask, trace_paths, choose_path,
                                     straight_reach, body_px)
+from team_navigation import vision_yellow
 from team_navigation.geometry import pixel_to_floor, homography_from_list
 from team_navigation.controller import pure_pursuit, pursue
 
@@ -47,6 +55,14 @@ class Navigation(Node):
         self.blue_high = tuple(param('blue_hsv_high', [130, 255, 255]))
         self.car_low = tuple(param('car_hsv_low', [0, 0, 150]))
         self.car_high = tuple(param('car_hsv_high', [179, 80, 255]))
+        self.perception = param('perception', 'yellow')  # 'yellow' or 'blue_aware'
+        if self.perception not in ('yellow', 'blue_aware'):
+            raise ValueError(f"perception must be 'yellow' or 'blue_aware', not {self.perception!r}")
+        self.footprint_check = bool(param('footprint_check', False))
+        # perception: yellow (best-path) settings
+        self.path_gap_px = tuple(param('path_gap_px', [9, 25]))
+        self.edge_margin_frac = param('edge_margin_frac', .15)
+        # perception: blue_aware settings
         self.horizon_frac = param('horizon_frac', .28)
         self.path_settings = dict(
             horizon_frac=self.horizon_frac,
@@ -55,9 +71,12 @@ class Navigation(Node):
             obstacle_margin_px=param('car_margin_px', 15.),
             blue_hug_gain=param('blue_hug_gain', .3),
             turn_cost=param('turn_cost', .15),
-            robot_half_width_px=param('robot_half_width_px', 150.),
+            robot_half_width_px=(param('robot_half_width_px', 150.)
+                                 if self.footprint_check else 0.),
             footprint_skip_frac=param('footprint_skip_frac', .1))
         self.steering = param('steering', 'taut')  # 'taut' or 'center'
+        if self.steering not in ('taut', 'center'):
+            raise ValueError(f"steering must be 'taut' or 'center', not {self.steering!r}")
         self.taut_min_support = param('taut_min_support', .75)
         # Rows (at image_scale) the path must reach beyond the footprint
         # region before the robot moves; fewer means blocked -> stop.
@@ -82,6 +101,8 @@ class Navigation(Node):
         self.debug_pub = (self.create_publisher(Image, 'navigation/debug_image', 1)
                           if publish_debug else None)
         self.create_timer(.05, self.tick)
+        self.get_logger().info(f'mode: {self.mode_text()}, '
+                               f'speed {self.target_speed} m/s')
         if self.H is None:
             self.get_logger().warning(
                 'homography not calibrated: requesting zero motion '
@@ -108,6 +129,12 @@ class Navigation(Node):
         age = (now_ns - stamp_ns) / 1e9
         return -.05 <= age <= self.max_image_age
 
+    def mode_text(self):
+        """Short description of the active settings, e.g. for the viewer."""
+        treads = ('treads on' if self.footprint_check else 'treads off'
+                  ) if self.perception == 'blue_aware' else ''
+        return ' '.join(p for p in (self.perception, self.steering, treads) if p)
+
     def process_image(self, image):
         """Return the path centerline as [(u, v), ...] mask pixels, or None.
 
@@ -117,8 +144,11 @@ class Navigation(Node):
         previous = self.trail_px
         self.mask = self.blue = self.cars = self.trail_px = self.taut_px = None
         self.paths = []
+        self.blocked = False
         if image is None or not self.image_is_fresh():
             return None
+        if self.perception == 'yellow':
+            return self.process_yellow(image)
         self.mask, self.blue, car_coloured = color_masks(
             image, self.yellow_low, self.yellow_high, self.blue_low, self.blue_high,
             self.car_low, self.car_high, self.image_scale)
@@ -136,6 +166,20 @@ class Navigation(Node):
         if self.steering == 'taut' and self.trail_px and not self.blocked:
             found = straight_reach(self.trail_px, self.mask, self.blue, self.cars,
                                    self.taut_min_support, **self.path_settings)
+            self.taut_px = found[1] if found else None
+        return self.trail_px
+
+    def process_yellow(self, image):
+        """perception: yellow -- exactly the best-path branch's tracing."""
+        self.mask = vision_yellow.yellow_mask(image, self.yellow_low, self.yellow_high,
+                                              self.image_scale)
+        self.blue = self.cars = np.zeros_like(self.mask)  # not detected in this mode
+        rows = vision_yellow.corridor(self.mask, gap_px=self.path_gap_px)
+        self.trail_px = [(c, v) for c, v, _, _ in rows]
+        self.paths = [self.trail_px] if self.trail_px else []
+        if self.steering == 'taut' and rows:
+            h, w = self.mask.shape
+            found = vision_yellow.farthest_visible(rows, (w / 2, h), self.edge_margin_frac)
             self.taut_px = found[1] if found else None
         return self.trail_px
 
@@ -220,8 +264,8 @@ class Navigation(Node):
         followed. Cyan dots: other paths seen (the other way round a split).
         Yellow line: the straight line used by 'taut' steering. White circle:
         steering target. Grey dots either side of the followed path: where
-        the treads' outer edges would be (robot_half_width_px). Top line:
-        status and the request sent.
+        the treads' outer edges would be (footprint_check on). Top line:
+        status and the request sent; second line: the active mode.
         """
         if self.debug_pub is None or self.mask is None or self.image is None:
             return
@@ -252,7 +296,10 @@ class Navigation(Node):
         if self.target is not None and self.H is not None:
             u, v = pixel_to_floor([self.target], np.linalg.inv(self.H))[0]
             if self.used_taut and self.trail_px:
-                su, sv = self.trail_px[0]
+                # yellow: the line starts at the robot (bottom centre);
+                # blue_aware: at the start of the traced path.
+                su, sv = ((w / 2, h - 1) if self.perception == 'yellow'
+                          else self.trail_px[0])
                 cv2.line(view, (int(su), int(sv)), (int(u), int(v)), (0, 255, 255), 2)
             cv2.circle(view, (int(u), int(v)), 6, (255, 255, 255), 2)
         if self.H is None:
@@ -265,10 +312,11 @@ class Navigation(Node):
             status = 'PATH TOO SHORT'
         else:
             status = 'FOLLOWING (taut)' if self.used_taut else 'FOLLOWING'
-        text = f'{status}  v={forward:.2f} yaw={yaw:+.2f}'
-        for color, thickness in (((0, 0, 0), 3), ((255, 255, 255), 1)):
-            cv2.putText(view, text, (4, 14), cv2.FONT_HERSHEY_SIMPLEX, .4,
-                        color, thickness, cv2.LINE_AA)
+        lines = (f'{status}  v={forward:.2f} yaw={yaw:+.2f}', self.mode_text())
+        for y, text in zip((14, 28), lines):
+            for color, thickness in (((0, 0, 0), 3), ((255, 255, 255), 1)):
+                cv2.putText(view, text, (4, y), cv2.FONT_HERSHEY_SIMPLEX, .4,
+                            color, thickness, cv2.LINE_AA)
         msg = self.bridge.cv2_to_imgmsg(view, encoding='bgr8')
         msg.header.stamp = self.image_stamp
         self.debug_pub.publish(msg)

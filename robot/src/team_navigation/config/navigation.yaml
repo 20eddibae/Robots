@@ -1,15 +1,29 @@
 /**:
   ros__parameters:
     # A suggested development setting, not permission to move the car.
-    requested_forward_speed_m_s: 0.25
+    requested_forward_speed_m_s: 0.125
+
+    # ---- Mode switches. Override for one run without editing this file:
+    #   ros2 launch team_navigation team.launch.py namespace:="$ROBOT_NAMESPACE" \
+    #       perception:=blue_aware footprint_check:=true speed:=0.25
+    # perception: 'yellow' = the best-path branch's yellow-only tracing
+    # (ignores blue and cars). 'blue_aware' = yellow road with blue and other
+    # cars as no-go, both ways round a split (the settings further down).
+    perception: yellow
+    # blue_aware only: keep both treads off blue/cars (robot_half_width_px)
+    # and stop with BLOCKED (treads) when they cannot get past just ahead.
+    footprint_check: false
 
     # Steering. 'taut': aim at the farthest point of the traced path that can
-    # be reached in a straight line on the road and off no-go (ignores bends
-    # in the path, uses the road's width in turns); falls back to 'center'
-    # when that point is nearer than lookahead_m. 'center': aim at the path
-    # point lookahead_m ahead.
+    # be reached in a straight line inside the road (ignores bends in the
+    # path, uses the road's width in turns); falls back to 'center' when that
+    # point is nearer than lookahead_m. 'center': aim at the path point
+    # lookahead_m ahead.
     steering: taut
-    # Fraction (0..1) of the robot's width, tread to tread, that must be on
+    # perception: yellow -- keep the straight line this fraction of the
+    # path's width from each edge.
+    edge_margin_frac: 0.15
+    # perception: blue_aware -- fraction (0..1) of the robot's width, tread to tread, that must be on
     # yellow all along the straight line (see vision.footprint_support):
     # higher keeps the treads further inside the road, lower cuts corners.
     taut_min_support: 0.75
@@ -29,6 +43,11 @@
     # saturation but is darker (paper V ~205, wall V ~96).
     yellow_hsv_low: [18, 120, 140]
     yellow_hsv_high: [35, 255, 255]
+    # perception: yellow -- merge yellow groups closer than [sideways,
+    # along-path] pixels (at image_scale) before tracing. [0, 0] = off.
+    path_gap_px: [9, 25]
+
+    # ---- perception: blue_aware settings (ignored by 'yellow') ----
     # Blue paper is no-go: a path never touches it.
     blue_hsv_low: [95, 60, 40]
     blue_hsv_high: [130, 255, 255]
@@ -48,7 +67,7 @@
     # blue and cars, so neither tread touches them. ESTIMATE from holding arms
     # along the treads; measure with two sheets laid straight ahead (a letter
     # sheet is 21.6 cm wide, about the robot's width). 0.0 = treat the robot
-    # as a point (old behaviour).
+    # as a point. Used only when footprint_check is true.
     robot_half_width_px: 150.0
     # The bottom fraction of the image where the footprint is not applied:
     # the robot is already there, and its treads are outside the image.
